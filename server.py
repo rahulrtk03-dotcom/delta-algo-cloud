@@ -6,17 +6,20 @@ app = Flask(__name__)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # TradingView Pine v5 alert() sends plain text
+    print("✅ WEBHOOK HIT")   # 👈 NEW (important)
+
     raw_signal = request.data.decode("utf-8").strip()
 
     print("\n🔥 ALERT RECEIVED 🔥")
-    print(raw_signal)
+    print(f"RAW SIGNAL => {raw_signal}")
     print("====================")
 
     if raw_signal:
         handle_signal(raw_signal)
+    else:
+        print("⚠️ Empty signal received")
 
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
