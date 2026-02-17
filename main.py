@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from delta_rest_client import DeltaRestClient, OrderType
 
 # ----------------- DELTA CLIENT -----------------
@@ -27,19 +27,114 @@ def send_telegram(msg):
 # ----------------- CONFIG -----------------
 
 PRODUCT_ID = 84
-ORDER_SIZE = 1
-SYMBOL = "BTCUSD"   # 👉 future me dynamic bana sakte ho
+ORDER_SIZE = 10
+SYMBOL = "BTCUSD"
 
-# Position state
-current_position = None  # None | "LONG" | "SHORT"
+# ----------------- POSITION STATE -----------------
 
-# 🔥 NEW TRADE STATE (FEATURE ADDITION)
+current_position = None     # None | LONG | SHORT
 entry_price = None
 entry_time = None
 entry_side = None
 entry_order_id = None
 
-# ----------------- FUNCTIONS -----------------
+# ----------------- NEW HELPERS -----------------
+
+def get_ltp():
+    try:
+        ticker = delta_client.get_ticker(PRODUCT_ID)
+        return float(ticker["result"]["last_price"])
+    except Exception:
+        return 0.0
+
+
+def sync_position_on_startup():
+    """
+    NEW FEATURE:
+    Restart ke baad exchange se open position sync
+    """
+    global current_position, entry_price, entry_time, entry_side
+
+    try:
+        positions = delta_client.get_positions()
+        if not positions or "result" not in positions:
+            return
+
+        for pos in positions["result"]:
+            if pos.get("product_id") != PRODUCT_ID:
+                continue
+
+            size = float(pos.get("size", 0))
+            if size == 0:
+                continue
+
+            side = pos.get("side")  # buy / sell
+            entry_price = float(pos.get("entry_price", 0))
+            entry_time = datetime.utcnow() - timedelta(minutes=1)
+
+            if side == "buy":
+                current_position = "LONG"
+                entry_side = "BUY"
+            else:
+                current_position = "SHORT"
+                entry_side = "SELL"
+
+            send_telegram(
+                "🔄 POSITION SYNCED AFTER RESTART\n"
+                f"Symbol: {SYMBOL}\n"
+                f"Side: {current_position}\n"
+                f"Entry Price: {entry_price}\n"
+                f"Qty: {size}"
+            )
+
+            print("✅ POSITION SYNCED FROM DELTA", flush=True)
+            break
+
+    except Exception as e:
+        print("❌ POSITION SYNC FAILED:", e, flush=True)
+
+# ----------------- EXIT WITH SUMMARY -----------------
+
+def close_position_with_summary():
+    global current_position, entry_price, entry_time, entry_side
+
+    if current_position is None:
+        return
+
+    exit_side = "sell" if current_position == "LONG" else "buy"
+    print("⚠️ CLOSING POSITION WITH SUMMARY", flush=True)
+
+    delta_client.place_order(
+        product_id=PRODUCT_ID,
+        size=ORDER_SIZE,
+        side=exit_side,
+        order_type=OrderType.MARKET
+    )
+
+    exit_price = get_ltp()
+    exit_time = datetime.utcnow()
+
+    if entry_side == "BUY":
+        pnl = (exit_price - entry_price) * ORDER_SIZE
+    else:
+        pnl = (entry_price - exit_price) * ORDER_SIZE
+
+    duration = exit_time - entry_time
+
+    send_telegram(
+        "⚠️ POSITION CLOSED\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Exit Price: {exit_price}\n"
+        f"PnL: {round(pnl, 2)}\n"
+        f"Holding Time: {duration}"
+    )
+
+    current_position = None
+    entry_price = None
+    entry_time = None
+    entry_side = None
+
+# ----------------- ORIGINAL BUY / SELL -----------------
 
 def buy():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
@@ -50,39 +145,29 @@ def buy():
         return
 
     if current_position == "SHORT":
-        close_position()
+        close_position_with_summary()
 
-    try:
-        print("🟢 PLACING BUY ORDER", flush=True)
-        resp = delta_client.place_order(
-            product_id=PRODUCT_ID,
-            size=ORDER_SIZE,
-            side='buy',
-            order_type=OrderType.MARKET
-        )
+    resp = delta_client.place_order(
+        product_id=PRODUCT_ID,
+        size=ORDER_SIZE,
+        side="buy",
+        order_type=OrderType.MARKET
+    )
 
-        result = resp.get("result", {})
-        entry_price = float(result.get("avg_fill_price", 0))
-        entry_order_id = result.get("id", "NA")
-        entry_time = datetime.utcnow()
-        entry_side = "BUY"
+    result = resp.get("result", {})
+    entry_price = float(result.get("avg_fill_price") or get_ltp())
+    entry_order_id = result.get("id", "NA")
+    entry_time = datetime.utcnow()
+    entry_side = "BUY"
+    current_position = "LONG"
 
-        current_position = "LONG"
-
-        msg = (
-            "🟢 BUY EXECUTED\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Price: {entry_price}\n"
-            f"Qty: {ORDER_SIZE}\n"
-            f"Order ID: {entry_order_id}\n"
-            f"Time (UTC): {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-        print(msg, flush=True)
-        send_telegram(msg)
-
-    except Exception as e:
-        send_telegram(f"❌ BUY FAILED\n{e}")
+    send_telegram(
+        "🟢 BUY EXECUTED\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Price: {entry_price}\n"
+        f"Qty: {ORDER_SIZE}\n"
+        f"Time (UTC): {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
 
 def sell():
@@ -94,77 +179,29 @@ def sell():
         return
 
     if current_position == "LONG":
-        close_position()
+        close_position_with_summary()
 
-    try:
-        print("🔴 PLACING SELL ORDER", flush=True)
-        resp = delta_client.place_order(
-            product_id=PRODUCT_ID,
-            size=ORDER_SIZE,
-            side='sell',
-            order_type=OrderType.MARKET
-        )
+    resp = delta_client.place_order(
+        product_id=PRODUCT_ID,
+        size=ORDER_SIZE,
+        side="sell",
+        order_type=OrderType.MARKET
+    )
 
-        result = resp.get("result", {})
-        exit_price = float(result.get("avg_fill_price", 0))
-        exit_order_id = result.get("id", "NA")
-        exit_time = datetime.utcnow()
+    result = resp.get("result", {})
+    entry_price = float(result.get("avg_fill_price") or get_ltp())
+    entry_order_id = result.get("id", "NA")
+    entry_time = datetime.utcnow()
+    entry_side = "SELL"
+    current_position = "SHORT"
 
-        # 📊 PnL calculation (previous trade)
-        pnl = 0
-        if entry_side == "BUY":
-            pnl = (exit_price - entry_price) * ORDER_SIZE
-
-        duration = exit_time - entry_time
-
-        msg = (
-            "🔴 SELL EXECUTED\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Exit Price: {exit_price}\n"
-            f"Qty: {ORDER_SIZE}\n"
-            f"Order ID: {exit_order_id}\n\n"
-            "📊 TRADE SUMMARY\n"
-            f"Entry Price: {entry_price}\n"
-            f"PnL: {round(pnl, 2)}\n"
-            f"Duration: {duration}"
-        )
-
-        print(msg, flush=True)
-        send_telegram(msg)
-
-        # reset state
-        current_position = "SHORT"
-        entry_price = exit_price
-        entry_time = exit_time
-        entry_side = "SELL"
-        entry_order_id = exit_order_id
-
-    except Exception as e:
-        send_telegram(f"❌ SELL FAILED\n{e}")
-
-
-def close_position():
-    global current_position
-
-    if current_position is None:
-        return
-
-    side = 'sell' if current_position == "LONG" else 'buy'
-    print("⚠️ CLOSING POSITION", flush=True)
-
-    try:
-        delta_client.place_order(
-            product_id=PRODUCT_ID,
-            size=ORDER_SIZE,
-            side=side,
-            order_type=OrderType.MARKET
-        )
-
-        current_position = None
-        send_telegram("⚠️ POSITION CLOSED")
-
-    except Exception as e:
-        send_telegram(f"❌ CLOSE POSITION FAILED\n{e}")
+    send_telegram(
+        "🔴 SELL EXECUTED\n"
+        f"Symbol: {SYMBOL}\n"
+        f"Price: {entry_price}\n"
+        f"Qty: {ORDER_SIZE}\n"
+        f"Time (UTC): {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
 
 # ----------------- SIGNAL HANDLER -----------------
 
@@ -174,10 +211,9 @@ def handle_signal(signal):
 
     if "BUY" in signal:
         buy()
-
     elif "SELL" in signal:
         sell()
 
-    else:
-        print("⚠️ UNKNOWN SIGNAL", flush=True)
+# 🔥 AUTO SYNC ON IMPORT / STARTUP
+sync_position_on_startup()
 
