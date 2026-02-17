@@ -1,7 +1,10 @@
 import os
+import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from delta_rest_client import DeltaRestClient, OrderType
+
+STATE_FILE = "state.json"
 
 # ----------------- DELTA CLIENT -----------------
 
@@ -27,7 +30,7 @@ def send_telegram(msg):
 # ----------------- CONFIG -----------------
 
 PRODUCT_ID = 84
-ORDER_SIZE = 10
+ORDER_SIZE = 1
 SYMBOL = "BTCUSD"
 
 # ----------------- POSITION STATE -----------------
@@ -38,7 +41,42 @@ entry_time = None
 entry_side = None
 entry_order_id = None
 
-# ----------------- NEW HELPERS -----------------
+# ----------------- STATE FILE HELPERS -----------------
+
+def save_state():
+    data = {
+        "current_position": current_position,
+        "entry_price": entry_price,
+        "entry_time": entry_time.isoformat() if entry_time else None,
+        "entry_side": entry_side,
+        "entry_order_id": entry_order_id
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def load_state():
+    global current_position, entry_price, entry_time, entry_side, entry_order_id
+
+    if not os.path.exists(STATE_FILE):
+        return
+
+    try:
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+
+        current_position = data.get("current_position")
+        entry_price = data.get("entry_price")
+        entry_side = data.get("entry_side")
+        entry_order_id = data.get("entry_order_id")
+
+        et = data.get("entry_time")
+        entry_time = datetime.fromisoformat(et) if et else None
+
+    except Exception as e:
+        print("❌ STATE LOAD FAILED:", e, flush=True)
+
+# ----------------- PRICE FIX -----------------
 
 def get_ltp():
     try:
@@ -47,62 +85,15 @@ def get_ltp():
     except Exception:
         return 0.0
 
-
-def sync_position_on_startup():
-    """
-    NEW FEATURE:
-    Restart ke baad exchange se open position sync
-    """
-    global current_position, entry_price, entry_time, entry_side
-
-    try:
-        positions = delta_client.get_positions()
-        if not positions or "result" not in positions:
-            return
-
-        for pos in positions["result"]:
-            if pos.get("product_id") != PRODUCT_ID:
-                continue
-
-            size = float(pos.get("size", 0))
-            if size == 0:
-                continue
-
-            side = pos.get("side")  # buy / sell
-            entry_price = float(pos.get("entry_price", 0))
-            entry_time = datetime.utcnow() - timedelta(minutes=1)
-
-            if side == "buy":
-                current_position = "LONG"
-                entry_side = "BUY"
-            else:
-                current_position = "SHORT"
-                entry_side = "SELL"
-
-            send_telegram(
-                "🔄 POSITION SYNCED AFTER RESTART\n"
-                f"Symbol: {SYMBOL}\n"
-                f"Side: {current_position}\n"
-                f"Entry Price: {entry_price}\n"
-                f"Qty: {size}"
-            )
-
-            print("✅ POSITION SYNCED FROM DELTA", flush=True)
-            break
-
-    except Exception as e:
-        print("❌ POSITION SYNC FAILED:", e, flush=True)
-
 # ----------------- EXIT WITH SUMMARY -----------------
 
 def close_position_with_summary():
-    global current_position, entry_price, entry_time, entry_side
+    global current_position, entry_price, entry_time, entry_side, entry_order_id
 
     if current_position is None:
         return
 
     exit_side = "sell" if current_position == "LONG" else "buy"
-    print("⚠️ CLOSING POSITION WITH SUMMARY", flush=True)
 
     delta_client.place_order(
         product_id=PRODUCT_ID,
@@ -133,13 +124,13 @@ def close_position_with_summary():
     entry_price = None
     entry_time = None
     entry_side = None
+    entry_order_id = None
+    save_state()
 
-# ----------------- ORIGINAL BUY / SELL -----------------
+# ----------------- BUY / SELL (OLD LOGIC PRESERVED) -----------------
 
 def buy():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
-
-    print("🟢 BUY FUNCTION CALLED", flush=True)
 
     if current_position == "LONG":
         return
@@ -156,24 +147,24 @@ def buy():
 
     result = resp.get("result", {})
     entry_price = float(result.get("avg_fill_price") or get_ltp())
-    entry_order_id = result.get("id", "NA")
     entry_time = datetime.utcnow()
     entry_side = "BUY"
+    entry_order_id = result.get("id", "NA")
     current_position = "LONG"
+
+    save_state()
 
     send_telegram(
         "🟢 BUY EXECUTED\n"
         f"Symbol: {SYMBOL}\n"
         f"Price: {entry_price}\n"
         f"Qty: {ORDER_SIZE}\n"
-        f"Time (UTC): {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
 
 def sell():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
-
-    print("🔴 SELL FUNCTION CALLED", flush=True)
 
     if current_position == "SHORT":
         return
@@ -190,17 +181,19 @@ def sell():
 
     result = resp.get("result", {})
     entry_price = float(result.get("avg_fill_price") or get_ltp())
-    entry_order_id = result.get("id", "NA")
     entry_time = datetime.utcnow()
     entry_side = "SELL"
+    entry_order_id = result.get("id", "NA")
     current_position = "SHORT"
+
+    save_state()
 
     send_telegram(
         "🔴 SELL EXECUTED\n"
         f"Symbol: {SYMBOL}\n"
         f"Price: {entry_price}\n"
         f"Qty: {ORDER_SIZE}\n"
-        f"Time (UTC): {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
 # ----------------- SIGNAL HANDLER -----------------
@@ -214,6 +207,10 @@ def handle_signal(signal):
     elif "SELL" in signal:
         sell()
 
-# 🔥 AUTO SYNC ON IMPORT / STARTUP
-sync_position_on_startup()
+# ----------------- SAFE STARTUP MESSAGE -----------------
+
+send_telegram(
+    "⚠️ BOT RESTARTED\n"
+    "Manual position check recommended"
+)
 
