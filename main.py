@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from datetime import datetime
 from delta_rest_client import DeltaRestClient, OrderType
@@ -54,7 +55,6 @@ def save_state():
     with open(STATE_FILE, "w") as f:
         json.dump(data, f)
 
-
 def load_state():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
 
@@ -73,17 +73,25 @@ def load_state():
         et = data.get("entry_time")
         entry_time = datetime.fromisoformat(et) if et else None
 
+        print("✅ STATE LOADED:", current_position, flush=True)
+
     except Exception as e:
         print("❌ STATE LOAD FAILED:", e, flush=True)
 
-# ----------------- PRICE FIX -----------------
+# ----------------- SAFE LTP -----------------
 
-def get_ltp():
-    try:
-        ticker = delta_client.get_ticker(PRODUCT_ID)
-        return float(ticker["result"]["last_price"])
-    except Exception:
-        return 0.0
+def get_ltp(retry=3, delay=1):
+    for _ in range(retry):
+        try:
+            ticker = delta_client.get_ticker(PRODUCT_ID)
+            price = float(ticker["result"]["last_price"])
+            if price > 0:
+                return price
+        except Exception:
+            pass
+        time.sleep(delay)
+
+    raise Exception("❌ LTP FETCH FAILED")
 
 # ----------------- EXIT WITH SUMMARY -----------------
 
@@ -115,6 +123,8 @@ def close_position_with_summary():
     send_telegram(
         "⚠️ POSITION CLOSED\n"
         f"Symbol: {SYMBOL}\n"
+        f"Side: {entry_side}\n"
+        f"Entry Price: {entry_price}\n"
         f"Exit Price: {exit_price}\n"
         f"PnL: {round(pnl, 2)}\n"
         f"Holding Time: {duration}"
@@ -127,7 +137,7 @@ def close_position_with_summary():
     entry_order_id = None
     save_state()
 
-# ----------------- BUY / SELL (OLD LOGIC PRESERVED) -----------------
+# ----------------- BUY -----------------
 
 def buy():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
@@ -162,6 +172,7 @@ def buy():
         f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
+# ----------------- SELL -----------------
 
 def sell():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
@@ -207,10 +218,7 @@ def handle_signal(signal):
     elif "SELL" in signal:
         sell()
 
-# ----------------- SAFE STARTUP MESSAGE -----------------
+# ----------------- LOAD STATE ON STARTUP -----------------
 
-send_telegram(
-    "⚠️ BOT RESTARTED\n"
-    "Manual position check recommended"
-)
+load_state()
 
