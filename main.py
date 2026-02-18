@@ -42,6 +42,8 @@ entry_time = None
 entry_side = None
 entry_order_id = None
 
+last_known_ltp = None   # 🔥 NEW (safe fallback)
+
 # ----------------- STATE FILE HELPERS -----------------
 
 def save_state():
@@ -78,20 +80,28 @@ def load_state():
     except Exception as e:
         print("❌ STATE LOAD FAILED:", e, flush=True)
 
-# ----------------- SAFE LTP -----------------
+# ----------------- SAFE LTP (NO CRASH) -----------------
 
-def get_ltp(retry=3, delay=1):
+def get_ltp(retry=5, delay=2):
+    global last_known_ltp
+
     for _ in range(retry):
         try:
             ticker = delta_client.get_ticker(PRODUCT_ID)
             price = float(ticker["result"]["last_price"])
             if price > 0:
+                last_known_ltp = price
                 return price
         except Exception:
             pass
         time.sleep(delay)
 
-    raise Exception("❌ LTP FETCH FAILED")
+    # fallback (NO exception)
+    if last_known_ltp:
+        print("⚠️ Using last known LTP:", last_known_ltp, flush=True)
+        return last_known_ltp
+
+    return entry_price if entry_price else 0.0
 
 # ----------------- EXIT WITH SUMMARY -----------------
 
@@ -157,6 +167,10 @@ def buy():
 
     result = resp.get("result", {})
     entry_price = float(result.get("avg_fill_price") or get_ltp())
+    if entry_price <= 0:
+        send_telegram("❌ BUY FAILED: Price unavailable")
+        return
+
     entry_time = datetime.utcnow()
     entry_side = "BUY"
     entry_order_id = result.get("id", "NA")
@@ -192,6 +206,10 @@ def sell():
 
     result = resp.get("result", {})
     entry_price = float(result.get("avg_fill_price") or get_ltp())
+    if entry_price <= 0:
+        send_telegram("❌ SELL FAILED: Price unavailable")
+        return
+
     entry_time = datetime.utcnow()
     entry_side = "SELL"
     entry_order_id = result.get("id", "NA")
