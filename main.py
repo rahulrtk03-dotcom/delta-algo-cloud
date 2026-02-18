@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime
+from threading import Lock
 from delta_rest_client import DeltaRestClient, OrderType
 
 STATE_FILE = "state.json"
@@ -34,6 +35,14 @@ PRODUCT_ID = 84
 ORDER_SIZE = 1
 SYMBOL = "BTCUSD"
 
+# ----------------- GLOBAL SAFETY -----------------
+
+signal_lock = Lock()
+last_signal_time = 0
+COOLDOWN_SECONDS = 2    # 🔥 1S TF ke liye safe (5m TF me negligible)
+
+last_known_ltp = None
+
 # ----------------- POSITION STATE -----------------
 
 current_position = None     # None | LONG | SHORT
@@ -42,9 +51,7 @@ entry_time = None
 entry_side = None
 entry_order_id = None
 
-last_known_ltp = None   # price memory
-
-# ----------------- STATE FILE HELPERS -----------------
+# ----------------- STATE FILE -----------------
 
 def save_state():
     data = {
@@ -80,9 +87,9 @@ def load_state():
     except Exception as e:
         print("❌ STATE LOAD FAILED:", e, flush=True)
 
-# ----------------- SAFE LTP (NO CRASH) -----------------
+# ----------------- SAFE LTP -----------------
 
-def get_ltp(retry=5, delay=2):
+def get_ltp(retry=5, delay=1):
     global last_known_ltp
 
     for _ in range(retry):
@@ -101,7 +108,7 @@ def get_ltp(retry=5, delay=2):
 
     return entry_price if entry_price else 0.0
 
-# ----------------- EXIT WITH SUMMARY -----------------
+# ----------------- EXIT -----------------
 
 def close_position_with_summary():
     global current_position, entry_price, entry_time, entry_side, entry_order_id
@@ -121,21 +128,20 @@ def close_position_with_summary():
     exit_price = get_ltp()
     exit_time = datetime.utcnow()
 
-    if entry_side == "BUY":
-        pnl = (exit_price - entry_price) * ORDER_SIZE
-    else:
-        pnl = (entry_price - exit_price) * ORDER_SIZE
-
-    duration = exit_time - entry_time
+    pnl = (
+        (exit_price - entry_price) * ORDER_SIZE
+        if entry_side == "BUY"
+        else (entry_price - exit_price) * ORDER_SIZE
+    )
 
     send_telegram(
         "⚠️ POSITION CLOSED\n"
         f"Symbol: {SYMBOL}\n"
         f"Side: {entry_side}\n"
-        f"Entry Price: {entry_price}\n"
-        f"Exit Price: {exit_price}\n"
+        f"Entry: {entry_price}\n"
+        f"Exit: {exit_price}\n"
         f"PnL: {round(pnl, 2)}\n"
-        f"Holding Time: {duration}"
+        f"Time Held: {exit_time - entry_time}"
     )
 
     current_position = None
@@ -167,11 +173,8 @@ def buy():
     entry_price = float(result.get("avg_fill_price") or 0)
 
     if entry_price <= 0:
-        time.sleep(2)
+        time.sleep(1)
         entry_price = get_ltp()
-
-    if entry_price <= 0:
-        entry_price = last_known_ltp
 
     entry_time = datetime.utcnow()
     entry_side = "BUY"
@@ -182,10 +185,7 @@ def buy():
 
     send_telegram(
         "🟢 BUY EXECUTED\n"
-        f"Symbol: {SYMBOL}\n"
-        f"Price: {entry_price}\n"
-        f"Qty: {ORDER_SIZE}\n"
-        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        f"{SYMBOL}\nPrice: {entry_price}\nQty: {ORDER_SIZE}"
     )
 
 # ----------------- SELL -----------------
@@ -210,11 +210,8 @@ def sell():
     entry_price = float(result.get("avg_fill_price") or 0)
 
     if entry_price <= 0:
-        time.sleep(2)
+        time.sleep(1)
         entry_price = get_ltp()
-
-    if entry_price <= 0:
-        entry_price = last_known_ltp
 
     entry_time = datetime.utcnow()
     entry_side = "SELL"
@@ -225,24 +222,44 @@ def sell():
 
     send_telegram(
         "🔴 SELL EXECUTED\n"
-        f"Symbol: {SYMBOL}\n"
-        f"Price: {entry_price}\n"
-        f"Qty: {ORDER_SIZE}\n"
-        f"Time: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        f"{SYMBOL}\nPrice: {entry_price}\nQty: {ORDER_SIZE}"
     )
 
-# ----------------- SIGNAL HANDLER -----------------
+# ----------------- SIGNAL HANDLER (CRASH PROOF) -----------------
 
 def handle_signal(signal):
+    global last_signal_time
+
+    now = time.time()
     signal = signal.upper()
-    print(f"📩 SIGNAL RECEIVED: {signal}", flush=True)
 
-    if "BUY" in signal:
-        buy()
-    elif "SELL" in signal:
-        sell()
+    if not signal_lock.acquire(blocking=False):
+        print("⏳ Busy, signal skipped", flush=True)
+        return
 
-# ----------------- LOAD STATE ON STARTUP -----------------
+    try:
+        if now - last_signal_time < COOLDOWN_SECONDS:
+            print("⏱️ Cooldown skip", flush=True)
+            return
+
+        print(f"📩 SIGNAL RECEIVED: {signal}", flush=True)
+
+        if "BUY" in signal and current_position == "LONG":
+            return
+        if "SELL" in signal and current_position == "SHORT":
+            return
+
+        if "BUY" in signal:
+            buy()
+        elif "SELL" in signal:
+            sell()
+
+        last_signal_time = now
+
+    finally:
+        signal_lock.release()
+
+# ----------------- STARTUP -----------------
 
 load_state()
 
