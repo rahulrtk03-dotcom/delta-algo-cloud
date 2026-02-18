@@ -42,7 +42,7 @@ entry_time = None
 entry_side = None
 entry_order_id = None
 
-last_known_ltp = None   # 🔥 NEW (safe fallback)
+last_known_ltp = None   # price memory
 
 # ----------------- STATE FILE HELPERS -----------------
 
@@ -96,9 +96,7 @@ def get_ltp(retry=5, delay=2):
             pass
         time.sleep(delay)
 
-    # fallback (NO exception)
     if last_known_ltp:
-        print("⚠️ Using last known LTP:", last_known_ltp, flush=True)
         return last_known_ltp
 
     return entry_price if entry_price else 0.0
@@ -166,10 +164,14 @@ def buy():
     )
 
     result = resp.get("result", {})
-    entry_price = float(result.get("avg_fill_price") or get_ltp())
+    entry_price = float(result.get("avg_fill_price") or 0)
+
     if entry_price <= 0:
-        send_telegram("❌ BUY FAILED: Price unavailable")
-        return
+        time.sleep(2)
+        entry_price = get_ltp()
+
+    if entry_price <= 0:
+        entry_price = last_known_ltp
 
     entry_time = datetime.utcnow()
     entry_side = "BUY"
@@ -205,10 +207,14 @@ def sell():
     )
 
     result = resp.get("result", {})
-    entry_price = float(result.get("avg_fill_price") or get_ltp())
+    entry_price = float(result.get("avg_fill_price") or 0)
+
     if entry_price <= 0:
-        send_telegram("❌ SELL FAILED: Price unavailable")
-        return
+        time.sleep(2)
+        entry_price = get_ltp()
+
+    if entry_price <= 0:
+        entry_price = last_known_ltp
 
     entry_time = datetime.utcnow()
     entry_side = "SELL"
